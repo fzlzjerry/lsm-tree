@@ -62,7 +62,7 @@ impl<T: Ranged> std::ops::Deref for Run<T> {
     }
 }
 
-#[allow(
+#[expect(
     clippy::missing_panics_doc,
     clippy::must_use_candidate,
     reason = "Run is only publicly exported as a hidden fuzzing implementation detail"

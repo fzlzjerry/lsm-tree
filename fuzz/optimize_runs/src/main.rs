@@ -26,80 +26,90 @@ impl Ranged for FuzzTable {
     }
 }
 
-fn verify(runs: &Runs, tables: &[Table], expected: &BTreeMap<u8, u64>) {
-    let mut table_ids = runs
-        .iter()
-        .flat_map(|run| run.iter().map(|table| table.id))
-        .collect::<Vec<_>>();
-    table_ids.sort_unstable();
-    assert_eq!(table_ids, (0..tables.len()).collect::<Vec<_>>());
+#[derive(Default)]
+struct FuzzState {
+    buffer: Table,
+    runs: Runs,
+    tables: Vec<Table>,
+    expected: Table,
+}
 
-    for run in runs {
-        for adjacent in run.windows(2) {
-            assert!(
-                adjacent[0].key_range.max() < adjacent[1].key_range.min(),
-                "optimized run is not sorted and disjoint: {run:?}"
+impl FuzzState {
+    fn insert(&mut self, key: u8, seqno: u64) {
+        self.buffer.insert(key, seqno);
+        self.expected.insert(key, seqno);
+    }
+
+    fn verify(&self) {
+        let mut table_ids = self
+            .runs
+            .iter()
+            .flat_map(|run| run.iter().map(|table| table.id))
+            .collect::<Vec<_>>();
+        table_ids.sort_unstable();
+        assert_eq!(table_ids, (0..self.tables.len()).collect::<Vec<_>>());
+
+        for run in &self.runs {
+            for adjacent in run.windows(2) {
+                assert!(
+                    adjacent[0].key_range.max() < adjacent[1].key_range.min(),
+                    "optimized run is not sorted and disjoint: {run:?}"
+                );
+            }
+        }
+
+        for (&key, &expected_seqno) in &self.expected {
+            let actual = self.runs.iter().find_map(|run| {
+                run.get_for_key(&[key])
+                    .and_then(|table| self.tables[table.id].get(&key).copied())
+            });
+
+            assert_eq!(
+                actual,
+                Some(expected_seqno),
+                "wrong visible version for key {key}: runs={:?}",
+                self.runs
             );
         }
     }
 
-    for (&key, &expected_seqno) in expected {
-        let actual = runs.iter().find_map(|run| {
-            run.get_for_key(&[key])
-                .and_then(|table| tables[table.id].get(&key).copied())
-        });
+    fn flush(&mut self) {
+        if !self.buffer.is_empty() {
+            let min = *self
+                .buffer
+                .first_key_value()
+                .expect("buffer is not empty")
+                .0;
+            let max = *self.buffer.last_key_value().expect("buffer is not empty").0;
+            let id = self.tables.len();
 
-        assert_eq!(
-            actual,
-            Some(expected_seqno),
-            "wrong visible version for key {key}: runs={runs:?}"
-        );
+            self.tables.push(std::mem::take(&mut self.buffer));
+            self.runs.insert(
+                0,
+                Run::new(vec![FuzzTable {
+                    id,
+                    key_range: KeyRange::new((vec![min].into(), vec![max].into())),
+                }])
+                .expect("flushed table is not empty"),
+            );
+            self.runs = optimize_runs(std::mem::take(&mut self.runs));
+        }
+
+        self.verify();
     }
-}
-
-fn flush(
-    buffer: &mut BTreeMap<u8, u64>,
-    runs: &mut Runs,
-    tables: &mut Vec<Table>,
-    expected: &BTreeMap<u8, u64>,
-) {
-    if !buffer.is_empty() {
-        let min = *buffer.first_key_value().expect("buffer is not empty").0;
-        let max = *buffer.last_key_value().expect("buffer is not empty").0;
-        let id = tables.len();
-
-        tables.push(std::mem::take(buffer));
-        runs.insert(
-            0,
-            Run::new(vec![FuzzTable {
-                id,
-                key_range: KeyRange::new((vec![min].into(), vec![max].into())),
-            }])
-            .expect("flushed table is not empty"),
-        );
-        *runs = optimize_runs(std::mem::take(runs));
-    }
-
-    verify(runs, tables, expected);
 }
 
 fn run_operations(operations: impl IntoIterator<Item = Operation>) {
-    let mut buffer = BTreeMap::new();
-    let mut expected = BTreeMap::new();
-    let mut tables = Vec::new();
-    let mut runs = Vec::new();
+    let mut state = FuzzState::default();
 
     for operation in operations.into_iter().take(256) {
         match operation {
-            Operation::Insert { key, seqno } => {
-                buffer.insert(key, seqno);
-                expected.insert(key, seqno);
-            }
-            Operation::Flush => flush(&mut buffer, &mut runs, &mut tables, &expected),
+            Operation::Insert { key, seqno } => state.insert(key, seqno),
+            Operation::Flush => state.flush(),
         }
     }
 
-    flush(&mut buffer, &mut runs, &mut tables, &expected);
+    state.flush();
 }
 
 fn main() {
@@ -127,7 +137,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "not sorted and disjoint")]
     fn verify_rejects_unsorted_disjoint_ranges() {
-        let tables = [BTreeMap::from([(b'a', 1)]), BTreeMap::from([(b'z', 2)])];
+        let tables = vec![BTreeMap::from([(b'a', 1)]), BTreeMap::from([(b'z', 2)])];
         let expected = BTreeMap::from([(b'a', 1), (b'z', 2)]);
         let runs = vec![
             Run::new(vec![
@@ -143,7 +153,31 @@ mod tests {
             .unwrap(),
         ];
 
-        verify(&runs, &tables, &expected);
+        FuzzState {
+            runs,
+            tables,
+            expected,
+            ..FuzzState::default()
+        }
+        .verify();
+    }
+
+    #[test]
+    fn empty_and_repeated_flushes_preserve_state() {
+        let mut state = FuzzState::default();
+        state.flush();
+        assert!(state.tables.is_empty());
+        assert!(state.runs.is_empty());
+
+        state.insert(b'a', 1);
+        state.insert(b'a', 2);
+        state.flush();
+        state.flush();
+
+        assert!(state.buffer.is_empty());
+        assert_eq!(state.tables, vec![BTreeMap::from([(b'a', 2)])]);
+        assert_eq!(state.expected, BTreeMap::from([(b'a', 2)]));
+        assert_eq!(state.runs.len(), 1);
     }
 
     #[test]
